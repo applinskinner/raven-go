@@ -13,6 +13,8 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+
+	"github.com/pkg/errors"
 )
 
 // Stacktrace defines Sentry's spec compliant interface holding Stacktrace information - https://docs.sentry.io/development/sdk-dev/interfaces/stacktrace/
@@ -52,35 +54,46 @@ type StacktraceFrame struct {
 	InApp        bool     `json:"in_app"`
 }
 
-// GetOrNewStacktrace tries to get stacktrace from err as an interface of github.com/pkg/errors, or else NewStacktrace()
-func GetOrNewStacktrace(err error, skip int, context int, appPackagePrefixes []string) *Stacktrace {
-	type stackTracer interface {
-		StackTrace() []runtime.Frame
+type StackTracer interface {
+	StackTrace() errors.StackTrace
+}
+
+// Try to get stacktrace from err as an interface of github.com/pkg/errors, or else NewStacktrace()
+func GetOrNewStacktrace(err, cause error, skip int, context int, appPackagePrefixes []string) *Stacktrace {
+	// use the stacktrace of cause
+	var stacktracer StackTracer
+	var causeHasStacktrace, errHasStacktrace bool
+	stacktracer, causeHasStacktrace = cause.(StackTracer)
+
+	// if cause doesn't have a stacktrace, use the one of err
+	if !causeHasStacktrace {
+		stacktracer, errHasStacktrace = err.(StackTracer)
 	}
-	stacktrace, ok := err.(stackTracer)
-	if !ok {
-		return NewStacktrace(skip+1, context, appPackagePrefixes)
-	}
-	var frames []*StacktraceFrame
-	for f := range stacktrace.StackTrace() {
-		pc := uintptr(f) - 1
-		fn := runtime.FuncForPC(pc)
-		var fName string
-		var file string
-		var line int
-		if fn != nil {
-			file, line = fn.FileLine(pc)
-			fName = fn.Name()
-		} else {
-			file = "unknown"
-			fName = "unknown"
+
+	// if either has a trace, we can generate from it
+	if causeHasStacktrace || errHasStacktrace {
+		var frames []*StacktraceFrame
+		for _, f := range stacktracer.StackTrace() {
+			pc := uintptr(f) - 1
+			fn := runtime.FuncForPC(pc)
+			var fName string
+			var file string
+			var line int
+			if fn != nil {
+				file, line = fn.FileLine(pc)
+				fName = fn.Name()
+			} else {
+				file = "unknown"
+				fName = "unknown"
+			}
+			frame := NewStacktraceFrame(pc, fName, file, line, context, appPackagePrefixes)
+			if frame != nil {
+				frames = append([]*StacktraceFrame{frame}, frames...)
+			}
 		}
-		frame := NewStacktraceFrame(pc, fName, file, line, context, appPackagePrefixes)
-		if frame != nil {
-			frames = append([]*StacktraceFrame{frame}, frames...)
-		}
+		return &Stacktrace{Frames: frames}
 	}
-	return &Stacktrace{Frames: frames}
+	return NewStacktrace(skip+1, context, appPackagePrefixes)
 }
 
 // NewStacktrace intializes and populates a new stacktrace, skipping skip frames.
@@ -179,11 +192,11 @@ func isInAppFrame(frame StacktraceFrame, appPackagePrefixes []string) bool {
 	if frame.Module == "main" {
 		return true
 	}
-  for _, prefix := range appPackagePrefixes {
-    if strings.HasPrefix(frame.Module, prefix) && !strings.Contains(frame.Module, "vendor") && !strings.Contains(frame.Module, "third_party") {
-      return true
-    }
-  }
+	for _, prefix := range appPackagePrefixes {
+		if strings.HasPrefix(frame.Module, prefix) && !strings.Contains(frame.Module, "vendor") && !strings.Contains(frame.Module, "third_party") {
+			return true
+		}
+	}
 	return false
 }
 
